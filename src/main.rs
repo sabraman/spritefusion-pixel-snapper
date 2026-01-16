@@ -15,13 +15,27 @@ fn process_cli(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let is_batch = config.input_paths.len() > 1;
+    let mut all_files = Vec::new();
+    for path_str in &config.input_paths {
+        let path = Path::new(path_str);
+        if path.is_dir() {
+            expand_directory(path, &mut all_files)?;
+        } else {
+            all_files.push(path.to_path_buf());
+        }
+    }
 
-    for input_path_str in &config.input_paths {
-        let input_path = Path::new(input_path_str);
+    if all_files.is_empty() {
+        return Ok(());
+    }
+
+    let is_batch = all_files.len() > 1 || config.input_paths.iter().any(|p| Path::new(p).is_dir());
+
+    for input_path in all_files {
+        let input_path_str = input_path.to_string_lossy();
         println!("Processing: {}", input_path_str);
 
-        let img_bytes = std::fs::read(input_path).map_err(|e| {
+        let img_bytes = std::fs::read(&input_path).map_err(|e| {
             PixelSnapperError::ProcessingError(format!(
                 "Failed to read input file {}: {}",
                 input_path_str, e
@@ -30,7 +44,6 @@ fn process_cli(config: &Config) -> Result<()> {
 
         let output_path_str = if is_batch {
             let out_dir = config.output.as_deref().unwrap_or(".");
-            // Ensure output directory exists
             if out_dir != "." {
                 std::fs::create_dir_all(out_dir).map_err(|e| {
                     PixelSnapperError::ProcessingError(format!(
@@ -61,6 +74,26 @@ fn process_cli(config: &Config) -> Result<()> {
         })?;
 
         println!("Saved to: {}", output_path_str);
+    }
+    Ok(())
+}
+
+fn expand_directory(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).map_err(|e| {
+        PixelSnapperError::ProcessingError(format!("Failed to read directory {}: {}", dir.display(), e))
+    })? {
+        let entry = entry.map_err(|e| {
+            PixelSnapperError::ProcessingError(format!("Failed to access entry: {}", e))
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            expand_directory(&path, files)?;
+        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if ext_lower == "png" || ext_lower == "jpg" || ext_lower == "jpeg" {
+                files.push(path);
+            }
+        }
     }
     Ok(())
 }
