@@ -56,9 +56,24 @@ pub fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) ->
 
     let mut output_bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut output_bytes);
-    output_img
-        .write_to(&mut cursor, image::ImageFormat::Png)
-        .map_err(PixelSnapperError::ImageError)?;
+    // Optimize: Use Fast compression via `png` crate directly
+    // This allows explicit control over compression level properly.
+    let (width, height) = output_img.dimensions();
+    let mut encoder = png::Encoder::new(&mut cursor, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_filter(png::Filter::NoFilter);
+
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
+    writer
+        .write_image_data(output_img.as_raw())
+        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
+    writer
+        .finish()
+        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
 
     Ok(output_bytes)
 }
