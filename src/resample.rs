@@ -64,9 +64,14 @@ pub fn resample(
                     for y in ys..ye.min(in_height) {
                         let row_offset = y * in_width;
                         for x in xs..xe.min(in_width) {
-                            let color_idx = indexed[row_offset + x];
+                            // SAFETY: grid.rs sanitizes cuts to be <= limit.
+                            // row_offset + x is always within indexed bounds.
+                            let color_idx = unsafe { *indexed.get_unchecked(row_offset + x) };
                             if (color_idx as usize) < palette_size {
-                                counts[color_idx as usize] += 1;
+                                // SAFETY: color_idx < palette_size (checked above)
+                                unsafe {
+                                    *counts.get_unchecked_mut(color_idx as usize) += 1;
+                                }
                             }
                         }
                     }

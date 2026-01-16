@@ -188,57 +188,54 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
         });
     }
 
-    // Hybrid Strategy:
-    // 1. Collect opaque pixels.
-    // 2. If > 4096, randomly subsample 4096 for Training.
-    // 3. Run K-Means on Sample to get Centroids.
-    // 4. Parallel SIMD Map ALL pixels to Centroids.
+    // Hybrid Strategy with Reservoir Sampling:
+    // 1. Single-pass reservoir sampling to collect training pixels (no opaque_indices allocation).
+    // 2. Run K-Means on Sample to get Centroids.
+    // 3. Parallel SIMD Map ALL pixels to Centroids.
 
-    let opaque_indices: Vec<usize> = (0..width * height)
-        .filter(|&i| in_samples[i * 4 + 3] > 0)
-        .collect();
+    use rand::Rng;
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.k_seed);
 
-    if opaque_indices.is_empty() {
+    let max_samples = 4096;
+    let mut training_pixels: Vec<Srgb> = Vec::with_capacity(max_samples);
+    let mut opaque_count: usize = 0;
+
+    // Reservoir Sampling: Single pass, O(1) extra allocation beyond training_pixels
+    for i in 0..(width * height) {
+        let base = i * 4;
+        if in_samples[base + 3] > 0 {
+            // Opaque pixel
+            opaque_count += 1;
+
+            if training_pixels.len() < max_samples {
+                // Fill the reservoir
+                training_pixels.push(Srgb::new(
+                    in_samples[base] as f32 / 255.0,
+                    in_samples[base + 1] as f32 / 255.0,
+                    in_samples[base + 2] as f32 / 255.0,
+                ));
+            } else {
+                // Reservoir replacement with probability max_samples / opaque_count
+                let j = rng.gen_range(0..opaque_count);
+                if j < max_samples {
+                    training_pixels[j] = Srgb::new(
+                        in_samples[base] as f32 / 255.0,
+                        in_samples[base + 1] as f32 / 255.0,
+                        in_samples[base + 2] as f32 / 255.0,
+                    );
+                }
+            }
+        }
+    }
+
+    if training_pixels.is_empty() {
         return Ok(QuantizedImage {
             img: img.clone(),
             palette: vec![],
             indexed: vec![255u8; width * height],
         });
     }
-
-    // 1. Training Sample
-    let max_samples = 4096;
-    use rand::seq::IteratorRandom;
-    use rand::SeedableRng;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(config.k_seed);
-
-    let training_pixels: Vec<Srgb> = if opaque_indices.len() > max_samples {
-        opaque_indices
-            .iter()
-            .choose_multiple(&mut rng, max_samples)
-            .iter()
-            .map(|&&i| {
-                let base = i * 4;
-                Srgb::new(
-                    in_samples[base] as f32 / 255.0,
-                    in_samples[base + 1] as f32 / 255.0,
-                    in_samples[base + 2] as f32 / 255.0,
-                )
-            })
-            .collect()
-    } else {
-        opaque_indices
-            .iter()
-            .map(|&i| {
-                let base = i * 4;
-                Srgb::new(
-                    in_samples[base] as f32 / 255.0,
-                    in_samples[base + 1] as f32 / 255.0,
-                    in_samples[base + 2] as f32 / 255.0,
-                )
-            })
-            .collect()
-    };
 
     // println!("DEBUG: Training Pixels: {}, Total Opaque: {}", training_pixels.len(), opaque_indices.len());
 
