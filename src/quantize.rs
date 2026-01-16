@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::error::Result;
 use image::{Rgba, RgbaImage};
-use kmeans_colors::get_kmeans;
 use palette::{white_point::D65, FromColor, Lab, Srgba};
 
 use rayon::prelude::*;
@@ -12,10 +11,12 @@ pub fn auto_detect_k_colors(img: &RgbaImage) -> usize {
     for p in img.pixels() {
         if p[3] > 0 {
             unique_colors.insert(p.0);
+            if unique_colors.len() >= 32 {
+                return 32;
+            }
         }
     }
-    // Cap at a reasonable maximum for performance and sanity
-    unique_colors.len().clamp(1, 256)
+    unique_colors.len().clamp(1, 32)
 }
 
 /// Quantizes the image to a fixed number of colors using K-means clustering.
@@ -62,8 +63,8 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     let verbose = false;
     let seed = config.k_seed;
 
-    // Perform K-means clustering in Lab space
-    let result = get_kmeans(k, max_iter, converge, verbose, &lab_pixels, seed);
+    // Perform K-means clustering in Lab space using the faster Hamerly algorithm
+    let result = kmeans_colors::get_kmeans_hamerly(k, max_iter, converge, verbose, &lab_pixels, seed);
 
     // Map pixels back to their closest centroid in parallel
     let mut quantized_pixels = pixels.clone();
