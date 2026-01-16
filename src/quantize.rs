@@ -324,7 +324,7 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
         j += 8;
     }
 
-    use wide::i32x8;
+    use wide::{i32x4, i32x8, CmpEq, CmpLt};
     let mut indexed = vec![255u8; width * height];
 
     // Use a fixed chunk size to ensure enough work per thread
@@ -334,12 +334,97 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
         .enumerate()
         .for_each(|(chunk_idx, indices)| {
             let start_pixel = chunk_idx * chunk_size;
+            let palette_len = palette_vec.len();
 
-            // RLE Cache
+            // Process 4 pixels at a time for ILP
+            let limit_4 = indices.len() - (indices.len() % 4);
+            let mut i = 0;
+
+            while i < limit_4 {
+                let pixel_idx_base = start_pixel + i;
+                if pixel_idx_base + 3 >= in_samples.len() / 4 {
+                    break;
+                }
+
+                // Load 4 pixels (deinterleave RGBA -> R4, G4, B4, A4)
+                // SAFETY: bounds checked above
+                let (r4, g4, b4, a4) = unsafe {
+                    let b0 = (pixel_idx_base) * 4;
+                    let b1 = (pixel_idx_base + 1) * 4;
+                    let b2 = (pixel_idx_base + 2) * 4;
+                    let b3 = (pixel_idx_base + 3) * 4;
+                    (
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0) as i32,
+                            *in_samples.get_unchecked(b1) as i32,
+                            *in_samples.get_unchecked(b2) as i32,
+                            *in_samples.get_unchecked(b3) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 1) as i32,
+                            *in_samples.get_unchecked(b1 + 1) as i32,
+                            *in_samples.get_unchecked(b2 + 1) as i32,
+                            *in_samples.get_unchecked(b3 + 1) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 2) as i32,
+                            *in_samples.get_unchecked(b1 + 2) as i32,
+                            *in_samples.get_unchecked(b2 + 2) as i32,
+                            *in_samples.get_unchecked(b3 + 2) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 3) as i32,
+                            *in_samples.get_unchecked(b1 + 3) as i32,
+                            *in_samples.get_unchecked(b2 + 3) as i32,
+                            *in_samples.get_unchecked(b3 + 3) as i32,
+                        ]),
+                    )
+                };
+
+                // Initialize min_dist and best_idx for all 4 pixels
+                let mut min_dists = i32x4::splat(i32::MAX);
+                let mut best_idxs = i32x4::splat(0);
+
+                // Iterate through palette colors (scalar index, broadcast to 4 pixels)
+                for p_idx in 0..palette_len {
+                    // Broadcast palette color to all 4 lanes
+                    let pr = i32x4::splat(palette_r[p_idx]);
+                    let pg = i32x4::splat(palette_g[p_idx]);
+                    let pb = i32x4::splat(palette_b[p_idx]);
+
+                    let dr = r4 - pr;
+                    let dg = g4 - pg;
+                    let db = b4 - pb;
+
+                    let dist = (dr * dr) + (dg * dg) + (db * db);
+
+                    // Compare: is this distance smaller?
+                    let mask = dist.cmp_lt(min_dists);
+
+                    // Blend: update where mask is true
+                    min_dists = mask.blend(dist, min_dists);
+                    best_idxs = mask.blend(i32x4::splat(p_idx as i32), best_idxs);
+                }
+
+                // Branchless transparency: if alpha == 0, force index to 255
+                let transparent_mask = a4.cmp_eq(i32x4::splat(0));
+                let final_idxs: [i32; 4] =
+                    transparent_mask.blend(i32x4::splat(255), best_idxs).into();
+
+                // Write results
+                for j in 0..4 {
+                    let idx = final_idxs[j] as u8;
+                    indices[i + j] = idx;
+                }
+
+                i += 4;
+            }
+
+            // Scalar fallback for remaining pixels (with RLE cache)
             let mut prev_pixel_val: u32 = u32::MAX;
             let mut prev_best_idx: u8 = 0;
 
-            for (i, idx_ref) in indices.iter_mut().enumerate() {
+            while i < indices.len() {
                 let pixel_idx = start_pixel + i;
                 if pixel_idx >= in_samples.len() / 4 {
                     break;
@@ -347,34 +432,23 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
 
                 let base = pixel_idx * 4;
 
-                // Read pixel as u32 for single-instruction comparison
-                // Safety: in_samples is valid slice, base is checked.
-                // We use native endian reading.
                 let pixel_val = unsafe {
                     let ptr = in_samples.as_ptr().add(base);
                     *(ptr as *const u32)
                 };
 
-                // Check Transparency (little endian: A is last byte? or first? Depends on Format)
-                // image::RgbaImage is typically [R, G, B, A].
-                // So A is at base+3.
-                // Let's just check A explicitly to be safe across archs, or mask it.
-                // But the loop below checks `a > 0`.
-                // Let's stick to the existing transparency check style but optimize.
-
                 let a = in_samples[base + 3];
                 if a == 0 {
-                    // Transparent
-                    // Reset cache just in case, or treat as a "color"
                     prev_pixel_val = pixel_val;
                     prev_best_idx = 255;
-                    *idx_ref = 255;
+                    indices[i] = 255;
+                    i += 1;
                     continue;
                 }
 
-                // Optimization: If identical to previous pixel, copy result and skip math
                 if pixel_val == prev_pixel_val {
-                    *idx_ref = prev_best_idx;
+                    indices[i] = prev_best_idx;
+                    i += 1;
                     continue;
                 }
 
@@ -389,7 +463,7 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
                 let mut min_dist = i32::MAX;
                 let mut best_idx = 0;
 
-                let mut chunk_idx = 0;
+                let mut chunk_idx_inner = 0;
                 for k in 0..palette_chunks_r.len() {
                     let p_r = palette_chunks_r[k];
                     let p_g = palette_chunks_g[k];
@@ -405,21 +479,20 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
                     for (l, &d) in dist_arr.iter().enumerate() {
                         if d < min_dist {
                             min_dist = d;
-                            best_idx = chunk_idx + l;
+                            best_idx = chunk_idx_inner + l;
                         }
                     }
-                    chunk_idx += 8;
+                    chunk_idx_inner += 8;
                 }
 
-                if best_idx >= palette_vec.len() {
+                if best_idx >= palette_len {
                     best_idx = 0;
                 }
 
-                // Update Cache
                 prev_pixel_val = pixel_val;
                 prev_best_idx = best_idx as u8;
-
-                *idx_ref = prev_best_idx;
+                indices[i] = prev_best_idx;
+                i += 1;
             }
         });
 
