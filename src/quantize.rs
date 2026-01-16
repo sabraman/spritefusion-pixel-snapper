@@ -107,6 +107,7 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use image::Rgba;
 
     #[test]
     fn test_quantize_image_auto_colors() {

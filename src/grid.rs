@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 
 use rayon::prelude::*;
 
+#[allow(clippy::needless_range_loop)]
 pub fn compute_profiles(img: &RgbaImage) -> Result<(Vec<f64>, Vec<f64>)> {
     let (w, h) = img.dimensions();
     let width = w as usize;
