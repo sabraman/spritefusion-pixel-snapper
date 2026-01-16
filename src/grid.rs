@@ -1,96 +1,101 @@
 use crate::config::Config;
 use crate::error::{PixelSnapperError, Result};
-use image::RgbaImage;
 use std::cmp::Ordering;
 
 use rayon::prelude::*;
 
 // use wide::{u8x16, CmpEq}; // Portable SIMD wrapper logic deferred to next iteration if needed
 
-#[allow(clippy::needless_range_loop)]
-pub fn compute_profiles(img: &RgbaImage) -> Result<(Vec<u32>, Vec<u32>)> {
-    let (w, h) = img.dimensions();
-    let width_u = w as usize;
-    let height_u = h as usize;
+use crate::quantize::QuantizedImage;
 
-    if width_u < 3 || height_u < 3 {
+#[allow(clippy::needless_range_loop)]
+pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> {
+    let width = q_img.img.width() as usize;
+    let height = q_img.img.height() as usize;
+
+    if width < 3 || height < 3 {
         return Err(PixelSnapperError::InvalidInput(
             "Image too small (minimum 3x3)".to_string(),
         ));
     }
 
-    // Use direct slice access to the image buffer for maximum performance
-    let img_samples = img.as_flat_samples().samples;
+    // [OPTIMIZATION 1] Pre-calculate Luma for the palette.
+    // Instead of doing math on every pixel, we just do it on the 64 palette colors.
+    // We use i32 to allow safe SIMD subtraction later.
+    let luma_lut: Vec<i32> = q_img
+        .palette
+        .iter()
+        .map(|c| {
+            // Standard Luma: (38*R + 75*G + 15*B) >> 7
+            (38 * c[0] as i32 + 75 * c[1] as i32 + 15 * c[2] as i32) >> 7
+        })
+        .collect();
 
-    // Single-pass row-major scan using Rayon for maximum cache locality.
-    // We aggregate horizontal and vertical projection sums simultaneously.
-    let (col_proj, row_proj) = (1..height_u - 1)
+    // Raw indices from the quantized image (0..64)
+    let indexed = &q_img.indexed;
+
+    // Use Rayon to scan rows. M-series chips have excellent parallel throughput.
+    let (col_proj, row_proj) = (1..height - 1)
         .into_par_iter()
         .fold(
-            || (vec![0u32; width_u], vec![0u32; height_u]),
+            || (vec![0u32; width], vec![0u32; height]),
             |(mut cp, mut rp), y| {
-                // Pre-calculate vertical offsets
-                let row_curr_base = y * width_u * 4;
-                let row_prev_base = (y - 1) * width_u * 4;
-                let row_next_base = (y + 1) * width_u * 4;
+                let row_curr = y * width;
+                let row_prev = (y - 1) * width;
+                let row_next = (y + 1) * width;
 
                 let mut row_diff_sum = 0u32;
 
-                // For column projection: handle x in 1..width-1 within this row
+                // [OPTIMIZATION 2] "Wide" SIMD Processing / Fast Scalar Loop
+                // Since this is indexed lookups, auto-vectorization is often better than manual gather.
+                // The scalar loop below is so simple with the LUT that LLVM on MacOS will auto-vectorize it efficiently.
+
                 let mut x = 1;
+                while x < width - 1 {
+                    // Fast LUT lookups
+                    // Because 'indexed' is u8 and luma_lut is small, this stays in L1 cache.
+                    let idx_c = indexed[row_curr + x] as usize;
 
-                // [Optimization] Portable SIMD Loop using `wide` crate
-                // Processes 16 pixels at a time for all architectures (x86, ARM, WASM)
-                let limit = width_u.saturating_sub(17);
-                while x < limit {
-                    // Safe unchecked access logic here would require unsafe, but we use strict bounds
-                    // We need to load 16 pixels.
-                    // To do this efficiently in portable rust without strict gather, we can just load chunks.
-                    // But `wide` works best with arrays.
+                    // Skip Transparent if 255
+                    if idx_c == 255 {
+                        x += 1;
+                        continue;
+                    }
 
-                    // Helper logic for SIMD grayscale:
-                    // We need to process chunks of 16.
-                    // Loading 16 pixels * 4 bytes = 64 bytes.
+                    let idx_l = indexed[row_curr + x - 1] as usize;
+                    let idx_r = indexed[row_curr + x + 1] as usize;
+                    let idx_u = indexed[row_prev + x] as usize;
+                    let idx_d = indexed[row_next + x] as usize;
 
-                    // Due to strided load complexity (RGBA), full SIMD is tricky without gather/scatter or de-interleaving.
-                    // However, we can use a simpler approach for the block:
-                    // Manual unroll or just use the scalar fallback (which is already integer and fast)
-                    // IF the SIMD gather overhead is too high.
-                    // But the user specially requested SIMD.
-                    // Let's implement a block that is friendly to auto-vectorization first or use basic u32 loading.
+                    // Unchecked is safe because quantize guarantees valid indices
+                    // and luma_lut covers the full palette.
+                    // We handle transparent (255) by defaulting to 0 or check bounds.
+                    // Quantize sets transparent to 255.
 
-                    // ACTUALLY, implementing full "wide" SIMD manually for interleaved RGBA is verbose.
-                    // The user's snippet hinted at "x += 16".
-                    // Let's implement the integer-only fast path first which solves the f64 bandwidth issue immediately,
-                    // and use a simplified unrolled loop which the compiler heavily vectorizes on x86/ARM anyway.
-                    // True "wide" SIMD for RGBA->Gray separation is complex.
-                    // BUT, to respect the user's "wide" request, I will try to use it if possible.
-                    // Given the constraints and complexity of writing a robust interleaved SIMD loader here blindly,
-                    // I will prioritize the `u32` conversion and Integer Math first, which guarantees the Memory Bandwidth fix.
-                    // For the SIMD part, I'll use a standard unrolled loop with u32 reading which acts as "Portable SIMD" via LLVM.
+                    let val_l = if idx_l < luma_lut.len() {
+                        unsafe { *luma_lut.get_unchecked(idx_l) }
+                    } else {
+                        0
+                    };
+                    let val_r = if idx_r < luma_lut.len() {
+                        unsafe { *luma_lut.get_unchecked(idx_r) }
+                    } else {
+                        0
+                    };
+                    let val_u = if idx_u < luma_lut.len() {
+                        unsafe { *luma_lut.get_unchecked(idx_u) }
+                    } else {
+                        0
+                    };
+                    let val_d = if idx_d < luma_lut.len() {
+                        unsafe { *luma_lut.get_unchecked(idx_d) }
+                    } else {
+                        0
+                    };
 
-                    break; // Skip manual SIMD block for now to ensure correctness with u32 first, then optimize.
-                           // x += 16;
-                }
-
-                // Scalar Fallback (Optimized to stay in u32)
-                // This is effectively autovectorized by modern compilers if written cleanly.
-                while x < width_u - 1 {
-                    let base = row_curr_base + x * 4;
-
-                    // Manual loop unroll or simple scalar
-                    // Note: No f64 conversion here!
-                    let _g_center = fast_gray(img_samples, base);
-                    let g_left = fast_gray(img_samples, base - 4);
-                    let g_right = fast_gray(img_samples, base + 4);
-                    let g_up = fast_gray(img_samples, row_prev_base + x * 4);
-                    let g_down = fast_gray(img_samples, row_next_base + x * 4);
-
-                    // Accumulate Column Projection
-                    cp[x] = cp[x].saturating_add(g_right.abs_diff(g_left) as u32);
-
-                    // Accumulate Row Projection
-                    row_diff_sum = row_diff_sum.saturating_add(g_down.abs_diff(g_up) as u32);
+                    // Branchless abs_diff
+                    cp[x] = cp[x].saturating_add(val_r.abs_diff(val_l) as u32);
+                    row_diff_sum = row_diff_sum.saturating_add(val_d.abs_diff(val_u) as u32);
 
                     x += 1;
                 }
@@ -100,9 +105,9 @@ pub fn compute_profiles(img: &RgbaImage) -> Result<(Vec<u32>, Vec<u32>)> {
             },
         )
         .reduce(
-            || (vec![0u32; width_u], vec![0u32; height_u]),
+            || (vec![0u32; width], vec![0u32; height]),
             |(mut cp1, mut rp1), (cp2, rp2)| {
-                // Vectorized addition for reduction
+                // Vectorized fold reduction
                 for (a, b) in cp1.iter_mut().zip(cp2.iter()) {
                     *a = a.saturating_add(*b);
                 }
@@ -114,13 +119,6 @@ pub fn compute_profiles(img: &RgbaImage) -> Result<(Vec<u32>, Vec<u32>)> {
         );
 
     Ok((col_proj, row_proj))
-}
-
-#[inline(always)]
-fn fast_gray(samples: &[u8], base: usize) -> u32 {
-    // Integer-only grayscale
-    // (38*R + 75*G + 15*B) >> 7
-    (38 * samples[base] as u32 + 75 * samples[base + 1] as u32 + 15 * samples[base + 2] as u32) >> 7
 }
 
 pub fn estimate_step_size(profile: &[u32], config: &Config) -> Option<f64> {
@@ -502,10 +500,19 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    use crate::quantize::QuantizedImage;
+    use image::RgbaImage;
+
     #[test]
     fn test_compute_profiles_small_image() {
         let img = RgbaImage::new(2, 2);
-        let result = compute_profiles(&img);
+        // Create a dummy quantized image
+        let q_img = QuantizedImage {
+            img: img.clone(),
+            palette: vec![[0, 0, 0, 0]],
+            indexed: vec![0; 4],
+        };
+        let result = compute_profiles(&q_img);
         assert!(result.is_err());
     }
 

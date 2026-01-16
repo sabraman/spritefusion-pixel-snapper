@@ -1,6 +1,6 @@
-use std::process::Command;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[test]
 fn test_batch_processing_cli() {
@@ -17,17 +17,22 @@ fn test_batch_processing_cli() {
     // We expect the binary to be built already or use cargo run
     let status = Command::new("cargo")
         .args([
-            "run", 
-            "--release", 
-            "--", 
-            input_dir, 
-            "--output", 
-            output_dir
+            "run",
+            "--release",
+            "--bin",
+            "spritefusion-pixel-snapper",
+            "--",
+            input_dir,
+            "--output",
+            output_dir,
         ])
         .status()
         .expect("Failed to execute snapper");
 
-    assert!(status.success(), "Snapper exited with failure in batch mode");
+    assert!(
+        status.success(),
+        "Snapper exited with failure in batch mode"
+    );
 
     // Verify outputs
     let expected_files = vec![
@@ -39,7 +44,7 @@ fn test_batch_processing_cli() {
     for file in expected_files {
         let path = Path::new(output_dir).join(file);
         assert!(path.exists(), "Output file {} missing", file);
-        
+
         let metadata = fs::metadata(path).unwrap();
         assert!(metadata.len() > 0, "Output file {} is empty", file);
     }

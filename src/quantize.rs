@@ -337,6 +337,11 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
         .enumerate()
         .for_each(|(chunk_idx, indices)| {
             let start_pixel = chunk_idx * chunk_size;
+
+            // RLE Cache
+            let mut prev_pixel_val: u32 = u32::MAX;
+            let mut prev_best_idx: u8 = 0;
+
             for (i, idx_ref) in indices.iter_mut().enumerate() {
                 let pixel_idx = start_pixel + i;
                 if pixel_idx >= in_samples.len() / 4 {
@@ -344,46 +349,80 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
                 }
 
                 let base = pixel_idx * 4;
+
+                // Read pixel as u32 for single-instruction comparison
+                // Safety: in_samples is valid slice, base is checked.
+                // We use native endian reading.
+                let pixel_val = unsafe {
+                    let ptr = in_samples.as_ptr().add(base);
+                    *(ptr as *const u32)
+                };
+
+                // Check Transparency (little endian: A is last byte? or first? Depends on Format)
+                // image::RgbaImage is typically [R, G, B, A].
+                // So A is at base+3.
+                // Let's just check A explicitly to be safe across archs, or mask it.
+                // But the loop below checks `a > 0`.
+                // Let's stick to the existing transparency check style but optimize.
+
                 let a = in_samples[base + 3];
-                if a > 0 {
-                    let r = in_samples[base] as i32;
-                    let g = in_samples[base + 1] as i32;
-                    let b = in_samples[base + 2] as i32;
-
-                    let r_cur = i32x8::splat(r);
-                    let g_cur = i32x8::splat(g);
-                    let b_cur = i32x8::splat(b);
-
-                    let mut min_dist = i32::MAX;
-                    let mut best_idx = 0;
-
-                    let mut chunk_idx = 0;
-                    for k in 0..palette_chunks_r.len() {
-                        let p_r = palette_chunks_r[k];
-                        let p_g = palette_chunks_g[k];
-                        let p_b = palette_chunks_b[k];
-
-                        let dr = r_cur - p_r;
-                        let dg = g_cur - p_g;
-                        let db = b_cur - p_b;
-
-                        let dist_vec = (dr * dr) + (dg * dg) + (db * db);
-                        let dist_arr: [i32; 8] = dist_vec.into();
-
-                        for (l, &d) in dist_arr.iter().enumerate() {
-                            if d < min_dist {
-                                min_dist = d;
-                                best_idx = chunk_idx + l;
-                            }
-                        }
-                        chunk_idx += 8;
-                    }
-
-                    if best_idx >= palette_vec.len() {
-                        best_idx = 0;
-                    }
-                    *idx_ref = best_idx as u8;
+                if a == 0 {
+                    // Transparent
+                    // Reset cache just in case, or treat as a "color"
+                    prev_pixel_val = pixel_val;
+                    prev_best_idx = 255;
+                    *idx_ref = 255;
+                    continue;
                 }
+
+                // Optimization: If identical to previous pixel, copy result and skip math
+                if pixel_val == prev_pixel_val {
+                    *idx_ref = prev_best_idx;
+                    continue;
+                }
+
+                let r = in_samples[base] as i32;
+                let g = in_samples[base + 1] as i32;
+                let b = in_samples[base + 2] as i32;
+
+                let r_cur = i32x8::splat(r);
+                let g_cur = i32x8::splat(g);
+                let b_cur = i32x8::splat(b);
+
+                let mut min_dist = i32::MAX;
+                let mut best_idx = 0;
+
+                let mut chunk_idx = 0;
+                for k in 0..palette_chunks_r.len() {
+                    let p_r = palette_chunks_r[k];
+                    let p_g = palette_chunks_g[k];
+                    let p_b = palette_chunks_b[k];
+
+                    let dr = r_cur - p_r;
+                    let dg = g_cur - p_g;
+                    let db = b_cur - p_b;
+
+                    let dist_vec = (dr * dr) + (dg * dg) + (db * db);
+                    let dist_arr: [i32; 8] = dist_vec.into();
+
+                    for (l, &d) in dist_arr.iter().enumerate() {
+                        if d < min_dist {
+                            min_dist = d;
+                            best_idx = chunk_idx + l;
+                        }
+                    }
+                    chunk_idx += 8;
+                }
+
+                if best_idx >= palette_vec.len() {
+                    best_idx = 0;
+                }
+
+                // Update Cache
+                prev_pixel_val = pixel_val;
+                prev_best_idx = best_idx as u8;
+
+                *idx_ref = prev_best_idx;
             }
         });
 

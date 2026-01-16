@@ -24,7 +24,7 @@ pub fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) ->
     // Quantize and get pre-built palette + indexed buffer
     let quantized = crate::quantize::quantize_image(&rgba_img, &config)?;
 
-    let (profile_x, profile_y) = crate::grid::compute_profiles(&quantized.img)?;
+    let (profile_x, profile_y) = crate::grid::compute_profiles(&quantized)?;
 
     let step_x_opt = crate::grid::estimate_step_size(&profile_x, &config);
     let step_y_opt = crate::grid::estimate_step_size(&profile_y, &config);

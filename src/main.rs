@@ -3,6 +3,13 @@ use spritefusion_pixel_snapper::error::PixelSnapperError;
 use spritefusion_pixel_snapper::error::Result;
 use spritefusion_pixel_snapper::process_image_bytes_common;
 
+#[cfg(not(target_arch = "wasm32"))]
+use mimalloc::MiMalloc;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::path::Path;
 
 fn main() -> Result<()> {
