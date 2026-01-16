@@ -1,6 +1,7 @@
 use crate::error::{PixelSnapperError, Result};
 use image::{ImageBuffer, RgbaImage};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage> {
     if cols.len() < 2 || rows.len() < 2 {
@@ -14,15 +15,14 @@ pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaI
 
     let mut final_img: RgbaImage = ImageBuffer::new(out_w, out_h);
 
+    // Pre-compute input buffer access for performance
+    let in_samples = img.as_flat_samples().samples;
+    let in_width = img.width() as usize;
+    let in_stride = in_width * 4;
+
     {
-        // Safe parallel writing using chunks_exact_mut
         let w = out_w;
         let samples = final_img.as_flat_samples_mut().samples;
-        
-        // Prepare input buffer for unsafe reading in the inner loop
-        let in_samples = img.as_flat_samples().samples;
-        let in_width = img.width() as usize;
-        let in_stride = in_width * 4;
 
         samples
             .par_chunks_exact_mut(4)
@@ -40,41 +40,45 @@ pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaI
                     [0, 0, 0, 0]
                 } else if xe - xs == 1 && ye - ys == 1 {
                     // Extreme fast path for 1:1 mapped cells
-                    if xs < img.width() as usize && ys < img.height() as usize {
-                        img.get_pixel(xs as u32, ys as u32).0
+                    if xs < in_width && ys < img.height() as usize {
+                        let base = ys * in_stride + xs * 4;
+                        unsafe {
+                            let ptr = in_samples.as_ptr();
+                            [*ptr.add(base), *ptr.add(base+1), *ptr.add(base+2), *ptr.add(base+3)]
+                        }
                     } else {
                         [0, 0, 0, 0]
                     }
                 } else {
-                    // Optimized counting for small/medium cells
-                    let mut counts: Vec<([u8; 4], usize)> = Vec::with_capacity(4);
+                    // HashMap-based counting for cells
+                    // For small K (typical pixel art), this is very fast
+                    let mut counts: HashMap<[u8; 4], u32> = HashMap::with_capacity(16);
 
                     for y in ys..ye {
                         let y_offset = y * in_stride;
                         for x in xs..xe {
-                            // SECURITY: We trust the loop bounds (xs..xe, ys..ye) are bound-checked by the surrounding logic
-                            // and image dimensions.
                             let base = y_offset + x * 4;
                             unsafe {
-                                let samples_ptr = in_samples.as_ptr();
-                                let r = *samples_ptr.add(base) as u32;
-                                let g = *samples_ptr.add(base + 1) as u32;
-                                let b = *samples_ptr.add(base + 2) as u32;
-                                let a = *samples_ptr.add(base + 3) as u32;
-
+                                let ptr = in_samples.as_ptr();
+                                let a = *ptr.add(base + 3);
                                 if a > 0 {
-                                    let key = [r as u8, g as u8, b as u8, a as u8];
-                                    if let Some(entry) = counts.iter_mut().find(|e| e.0 == key) {
-                                        entry.1 += 1;
-                                    } else {
-                                        counts.push((key, 1));
-                                    }
+                                    let key = [*ptr.add(base), *ptr.add(base+1), *ptr.add(base+2), a];
+                                    *counts.entry(key).or_insert(0) += 1;
                                 }
                             }
                         }
                     }
 
-                    candidates_to_best_pixel(counts)
+                    // Find mode (most frequent color)
+                    let mut best_p = [0u8; 4];
+                    let mut max_count = 0u32;
+                    for (&color, &count) in counts.iter() {
+                        if count > max_count {
+                            max_count = count;
+                            best_p = color;
+                        }
+                    }
+                    best_p
                 };
 
                 pixel_sample[0] = best_pixel[0];
@@ -85,32 +89,6 @@ pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaI
     }
 
     Ok(final_img)
-}
-
-fn candidates_to_best_pixel(candidates: Vec<([u8; 4], usize)>) -> [u8; 4] {
-    if candidates.is_empty() {
-        return [0, 0, 0, 0];
-    }
-
-    let mut best_p = candidates[0].0;
-    let mut max_count = candidates[0].1;
-    let mut max_sum = best_p.iter().map(|&v| v as u32).sum::<u32>();
-
-    for &(p, count) in candidates.iter().skip(1) {
-        if count > max_count {
-            max_count = count;
-            best_p = p;
-            max_sum = p.iter().map(|&v| v as u32).sum::<u32>();
-        } else if count == max_count {
-            let sum = p.iter().map(|&v| v as u32).sum::<u32>();
-            if sum > max_sum {
-                best_p = p;
-                max_sum = sum;
-            }
-        }
-    }
-
-    best_p
 }
 
 #[cfg(test)]

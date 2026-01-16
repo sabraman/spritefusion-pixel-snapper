@@ -21,6 +21,7 @@ pub fn auto_detect_k_colors(img: &RgbaImage) -> usize {
 
 /// Quantizes the image to a fixed number of colors using K-means clustering.
 /// Uses Lab color space for better perceptual color selection.
+/// If the image already has ≤K unique colors, K-means is bypassed for O(N) mapping.
 pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     let k_target = if config.k_colors == 0 {
         auto_detect_k_colors(img)
@@ -28,6 +29,28 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         config.k_colors
     };
 
+    // Fast path: Collect unique colors. If ≤ k_target, bypass K-means.
+    let mut unique_colors = std::collections::HashMap::new();
+    let mut color_count = 0usize;
+    for p in img.pixels() {
+        if p[3] > 0 {
+            if !unique_colors.contains_key(&p.0) {
+                unique_colors.insert(p.0, color_count);
+                color_count += 1;
+            }
+            // Early exit if we exceed k_target (need K-means)
+            if color_count > k_target {
+                break;
+            }
+        }
+    }
+
+    // If unique colors ≤ k_target, we can skip K-means entirely!
+    if color_count <= k_target && color_count > 0 {
+        // Image already has ≤K colors, no quantization needed.
+        // Map pixels to palette (already the same, just return clone for consistency)
+        return Ok(img.clone());
+    }
 
     let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
 
