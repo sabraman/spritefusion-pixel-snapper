@@ -132,33 +132,33 @@ pub fn compute_profiles(img: &RgbaImage) -> Result<(Vec<f64>, Vec<f64>)> {
                     
                     // Column contrib: |gray(x+1, y) - gray(x-1, y)|
                     // Fixed-point grayscale: (38*R + 75*G + 15*B) >> 7
-                    let g_left = if img_samples[base - 4 + 3] == 0 { 0 } else {
-                        (38 * img_samples[base - 4] as u32 + 
+                    let g_left = if img_samples[base - 4 + 3] == 0 { 0i32 } else {
+                        ((38 * img_samples[base - 4] as u32 + 
                          75 * img_samples[base - 3] as u32 + 
-                         15 * img_samples[base - 2] as u32) >> 7
+                         15 * img_samples[base - 2] as u32) >> 7) as i32
                     };
-                    let g_right = if img_samples[base + 4 + 3] == 0 { 0 } else {
-                        (38 * img_samples[base + 4] as u32 + 
+                    let g_right = if img_samples[base + 4 + 3] == 0 { 0i32 } else {
+                        ((38 * img_samples[base + 4] as u32 + 
                          75 * img_samples[base + 5] as u32 + 
-                         15 * img_samples[base + 6] as u32) >> 7
+                         15 * img_samples[base + 6] as u32) >> 7) as i32
                     };
-                    cp[x] += (g_right as f64 - g_left as f64).abs();
+                    cp[x] += (g_right - g_left).unsigned_abs() as f64;
                     
                     // Row contrib: |gray(x, y+1) - gray(x, y-1)|
                     let base_prev = row_prev_base + x * 4;
                     let base_next = row_next_base + x * 4;
                     
-                    let g_top = if img_samples[base_prev + 3] == 0 { 0 } else {
-                        (38 * img_samples[base_prev] as u32 + 
+                    let g_top = if img_samples[base_prev + 3] == 0 { 0i32 } else {
+                        ((38 * img_samples[base_prev] as u32 + 
                          75 * img_samples[base_prev + 1] as u32 + 
-                         15 * img_samples[base_prev + 2] as u32) >> 7
+                         15 * img_samples[base_prev + 2] as u32) >> 7) as i32
                     };
-                    let g_bottom = if img_samples[base_next + 3] == 0 { 0 } else {
-                        (38 * img_samples[base_next] as u32 + 
+                    let g_bottom = if img_samples[base_next + 3] == 0 { 0i32 } else {
+                        ((38 * img_samples[base_next] as u32 + 
                          75 * img_samples[base_next + 1] as u32 + 
-                         15 * img_samples[base_next + 2] as u32) >> 7
+                         15 * img_samples[base_next + 2] as u32) >> 7) as i32
                     };
-                    row_diff_sum += (g_bottom as f64 - g_top as f64).abs();
+                    row_diff_sum += (g_bottom - g_top).unsigned_abs() as f64;
                     x += 1;
                 }
                 

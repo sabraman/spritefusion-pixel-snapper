@@ -38,35 +38,31 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
                 unique_colors.insert(p.0, color_count);
                 color_count += 1;
             }
-            // Early exit if we exceed k_target (need K-means)
             if color_count > k_target {
                 break;
             }
         }
     }
 
-    // If unique colors ≤ k_target, we can skip K-means entirely!
+    // If unique colors ≤ k_target, image is already "quantized"
     if color_count <= k_target && color_count > 0 {
-        // Image already has ≤K colors, no quantization needed.
-        // Map pixels to palette (already the same, just return clone for consistency)
         return Ok(img.clone());
     }
 
-    let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
+    let width = img.width() as usize;
+    let height = img.height() as usize;
+    let in_samples = img.as_flat_samples().samples;
 
-    let opaque_indices: Vec<usize> = pixels
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| if p[3] > 0 { Some(i) } else { None })
+    // Collect opaque pixel indices
+    let opaque_indices: Vec<usize> = (0..width * height)
+        .filter(|&i| in_samples[i * 4 + 3] > 0)
         .collect();
 
     if opaque_indices.is_empty() {
         return Ok(img.clone());
     }
 
-    // Convert opaque pixels to Lab for better perceptual clustering in parallel
-    // Generate or retrieve sRGB -> Linear lookup table
-    // This avoids expensive powf(2.4) calls for every pixel
+    // Generate sRGB -> Linear LUT once
     static SRGB_LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
     let lut = SRGB_LUT.get_or_init(|| {
         let mut table = [0.0; 256];
@@ -81,19 +77,15 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         table
     });
 
-    // Convert opaque pixels to Lab for better perceptual clustering in parallel
-    // We inline the conversion math to f32 & use LUT to maximize throughput on SIMD units
+    // Convert to Lab in parallel
     let lab_pixels: Vec<Lab<D65, f32>> = opaque_indices
         .par_iter()
         .map(|&i| {
-            let p = pixels[i];
-            
-            // Perceptual Lab conversion (Linearized SRGB -> XYZ -> Lab)
-            // Uses LUT for expensive gamma correction
-            let r = lut[p[0] as usize];
-            let g = lut[p[1] as usize];
-            let b = lut[p[2] as usize];
-            let a = p[3] as f32 / 255.0;
+            let base = i * 4;
+            let r = lut[in_samples[base] as usize];
+            let g = lut[in_samples[base + 1] as usize];
+            let b = lut[in_samples[base + 2] as usize];
+            let a = in_samples[base + 3] as f32 / 255.0;
 
             let linear = palette::LinSrgba::new(r, g, b, a);
             Lab::from_color(linear)
@@ -106,45 +98,50 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     let verbose = false;
     let seed = config.k_seed;
 
-    // Perform K-means clustering in Lab space using the faster Hamerly algorithm
+    // K-means clustering
     let result = kmeans_colors::get_kmeans_hamerly(k, max_iter, converge, verbose, &lab_pixels, seed);
 
-    // Prepare final image buffer
-    let mut new_img = img.clone();
-    let final_samples = new_img.as_flat_samples_mut().samples;
-
-    // Map quantized pixels back in parallel results
-    let results: Vec<(usize, [u8; 4])> = opaque_indices
-        .par_iter()
-        .enumerate()
-        .map(|(idx, &pixel_idx)| {
-            let centroid_idx = result.indices[idx];
-            let lab_centroid = result.centroids[centroid_idx as usize];
-            let srgba_centroid: Srgba = Srgba::from_color(lab_centroid);
-
-            // Preserve original alpha
-            let original_alpha = pixels[pixel_idx][3];
-            
-            let rgba = [
-                (srgba_centroid.red * 255.0).round() as u8,
-                (srgba_centroid.green * 255.0).round() as u8,
-                (srgba_centroid.blue * 255.0).round() as u8,
-                original_alpha,
-            ];
-            (pixel_idx, rgba)
+    // Pre-compute centroid RGB values (avoid repeated conversion in loop)
+    let centroid_rgba: Vec<[u8; 4]> = result.centroids
+        .iter()
+        .map(|&lab_c| {
+            let srgba: Srgba = Srgba::from_color(lab_c);
+            [
+                (srgba.red * 255.0).round() as u8,
+                (srgba.green * 255.0).round() as u8,
+                (srgba.blue * 255.0).round() as u8,
+                255, // Alpha handled separately
+            ]
         })
         .collect();
 
-    // Fast linear update (sequential but memory-efficient)
-    for (idx, rgba) in results {
-        let base = idx * 4;
-        final_samples[base] = rgba[0];
-        final_samples[base + 1] = rgba[1];
-        final_samples[base + 2] = rgba[2];
-        final_samples[base + 3] = rgba[3];
-    }
+    // Create output buffer - DIRECT WRITE instead of clone + scatter
+    let mut out_samples = in_samples.to_vec(); // Single copy
 
-    Ok(new_img)
+    // Direct parallel write using index-based access (each write is to unique index)
+    opaque_indices
+        .par_iter()
+        .enumerate()
+        .for_each(|(lab_idx, &pixel_idx)| {
+            let centroid_idx = result.indices[lab_idx] as usize;
+            let rgba = &centroid_rgba[centroid_idx];
+            let base = pixel_idx * 4;
+            
+            // Safe: each pixel_idx is unique, no data races
+            unsafe {
+                let ptr = out_samples.as_ptr() as *mut u8;
+                *ptr.add(base) = rgba[0];
+                *ptr.add(base + 1) = rgba[1];
+                *ptr.add(base + 2) = rgba[2];
+                // Alpha preserved from original (already in out_samples)
+            }
+        });
+
+    // Construct image from buffer - no additional copy
+    RgbaImage::from_raw(width as u32, height as u32, out_samples)
+        .ok_or_else(|| crate::error::PixelSnapperError::ProcessingError(
+            "Failed to create output image".to_string()
+        ))
 }
 
 #[cfg(test)]
@@ -166,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_quantize_image_empty_image() {
-        let img = RgbaImage::new(10, 10); // Fully transparent
+        let img = RgbaImage::new(10, 10);
         let config = Config::default();
         let result = quantize_image(&img, &config).unwrap();
         assert_eq!(result.dimensions(), (10, 10));
@@ -183,7 +180,6 @@ mod tests {
             ..Config::default()
         };
         let result = quantize_image(&img, &config).unwrap();
-        // Lab conversion/quantization should be very close to original red
         let p = result.get_pixel(0, 0);
         assert!(p[0] > 250);
         assert!(p[1] < 10);

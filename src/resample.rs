@@ -3,6 +3,9 @@ use image::{ImageBuffer, RgbaImage};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// Maximum palette size for fixed-array optimization
+const MAX_PALETTE: usize = 64;
+
 pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage> {
     if cols.len() < 2 || rows.len() < 2 {
         return Err(PixelSnapperError::ProcessingError(
@@ -13,12 +16,44 @@ pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaI
     let out_w = (cols.len().max(1) - 1) as u32;
     let out_h = (rows.len().max(1) - 1) as u32;
 
-    let mut final_img: RgbaImage = ImageBuffer::new(out_w, out_h);
-
-    // Pre-compute input buffer access for performance
     let in_samples = img.as_flat_samples().samples;
     let in_width = img.width() as usize;
+    let in_height = img.height() as usize;
     let in_stride = in_width * 4;
+
+    // Build palette and pre-index the entire image (single pass)
+    let mut color_to_idx: HashMap<[u8; 4], u8> = HashMap::with_capacity(MAX_PALETTE);
+    let mut palette: Vec<[u8; 4]> = Vec::with_capacity(MAX_PALETTE);
+    
+    // Pre-indexed image: each pixel maps to its palette index (or 255 for transparent)
+    let mut indexed_img: Vec<u8> = vec![255u8; in_width * in_height];
+    
+    for y in 0..in_height {
+        for x in 0..in_width {
+            let base = y * in_stride + x * 4;
+            let a = in_samples[base + 3];
+            if a > 0 {
+                let pixel = [in_samples[base], in_samples[base + 1], in_samples[base + 2], a];
+                let idx = if let Some(&existing) = color_to_idx.get(&pixel) {
+                    existing
+                } else {
+                    let new_idx = palette.len() as u8;
+                    if palette.len() < MAX_PALETTE {
+                        color_to_idx.insert(pixel, new_idx);
+                        palette.push(pixel);
+                        new_idx
+                    } else {
+                        255 // Overflow - treat as transparent for counting purposes
+                    }
+                };
+                indexed_img[y * in_width + x] = idx;
+            }
+        }
+    }
+    
+    let palette_size = palette.len();
+
+    let mut final_img: RgbaImage = ImageBuffer::new(out_w, out_h);
 
     {
         let w = out_w;
@@ -39,46 +74,38 @@ pub fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaI
                 let best_pixel = if xe <= xs || ye <= ys {
                     [0, 0, 0, 0]
                 } else if xe - xs == 1 && ye - ys == 1 {
-                    // Extreme fast path for 1:1 mapped cells
-                    if xs < in_width && ys < img.height() as usize {
-                        let base = ys * in_stride + xs * 4;
-                        unsafe {
-                            let ptr = in_samples.as_ptr();
-                            [*ptr.add(base), *ptr.add(base+1), *ptr.add(base+2), *ptr.add(base+3)]
-                        }
+                    // 1:1 fast path - direct lookup
+                    if xs < in_width && ys < in_height {
+                        let idx = indexed_img[ys * in_width + xs];
+                        if idx < palette_size as u8 { palette[idx as usize] } else { [0,0,0,0] }
                     } else {
                         [0, 0, 0, 0]
                     }
                 } else {
-                    // HashMap-based counting for cells
-                    // For small K (typical pixel art), this is very fast
-                    let mut counts: HashMap<[u8; 4], u32> = HashMap::with_capacity(16);
-
-                    for y in ys..ye {
-                        let y_offset = y * in_stride;
-                        for x in xs..xe {
-                            let base = y_offset + x * 4;
-                            unsafe {
-                                let ptr = in_samples.as_ptr();
-                                let a = *ptr.add(base + 3);
-                                if a > 0 {
-                                    let key = [*ptr.add(base), *ptr.add(base+1), *ptr.add(base+2), a];
-                                    *counts.entry(key).or_insert(0) += 1;
-                                }
+                    // ZERO-ALLOCATION: Fixed array counting using pre-indexed image
+                    let mut counts = [0u32; MAX_PALETTE];
+                    
+                    for y in ys..ye.min(in_height) {
+                        let row_offset = y * in_width;
+                        for x in xs..xe.min(in_width) {
+                            let color_idx = indexed_img[row_offset + x];
+                            if color_idx < palette_size as u8 {
+                                counts[color_idx as usize] += 1;
                             }
                         }
                     }
 
-                    // Find mode (most frequent color)
-                    let mut best_p = [0u8; 4];
+                    // Find mode in O(K)
+                    let mut best_idx = 0;
                     let mut max_count = 0u32;
-                    for (&color, &count) in counts.iter() {
+                    for (i, &count) in counts[..palette_size].iter().enumerate() {
                         if count > max_count {
                             max_count = count;
-                            best_p = color;
+                            best_idx = i;
                         }
                     }
-                    best_p
+                    
+                    if max_count > 0 { palette[best_idx] } else { [0, 0, 0, 0] }
                 };
 
                 pixel_sample[0] = best_pixel[0];
@@ -105,7 +132,6 @@ mod tests {
     #[test]
     fn test_resample_simple_grid() {
         let mut img = RgbaImage::new(10, 10);
-        // Fill the entire image with red
         for p in img.pixels_mut() {
             *p = image::Rgba([255, 0, 0, 255]);
         }
