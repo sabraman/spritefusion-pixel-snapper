@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use image::RgbaImage;
-use palette::{white_point::D65, FromColor, Lab, Srgba};
+use palette::Srgb;
 
 use rayon::prelude::*;
 
@@ -103,41 +103,26 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
         });
     }
 
-    // sRGB -> Linear LUT
-    static SRGB_LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-    let lut = SRGB_LUT.get_or_init(|| {
-        let mut table = [0.0; 256];
-        for (i, val) in table.iter_mut().enumerate() {
-            let s = i as f32 / 255.0;
-            *val = if s <= 0.04045 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            };
-        }
-        table
-    });
-
-    // Convert to Lab in parallel
-    let lab_pixels: Vec<Lab<D65, f32>> = opaque_indices
+    // Convert to Srgb floats in parallel (ignoring alpha for clustering)
+    let pixels: Vec<Srgb> = opaque_indices
         .par_iter()
         .map(|&i| {
             let base = i * 4;
-            let r = lut[in_samples[base] as usize];
-            let g = lut[in_samples[base + 1] as usize];
-            let b = lut[in_samples[base + 2] as usize];
-            let a = in_samples[base + 3] as f32 / 255.0;
-            Lab::from_color(palette::LinSrgba::new(r, g, b, a))
+            Srgb::new(
+                in_samples[base] as f32 / 255.0,
+                in_samples[base + 1] as f32 / 255.0,
+                in_samples[base + 2] as f32 / 255.0,
+            )
         })
         .collect();
 
-    let k = k_target.min(lab_pixels.len());
+    let k = k_target.min(pixels.len());
     let result = kmeans_colors::get_kmeans_hamerly(
         k,
         config.max_kmeans_iterations,
-        0.01,
+        0.001, // Tighter convergence for RGB
         false,
-        &lab_pixels,
+        &pixels,
         config.k_seed,
     );
 
@@ -145,12 +130,11 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
     let new_palette: Vec<[u8; 4]> = result
         .centroids
         .iter()
-        .map(|&lab_c| {
-            let srgba: Srgba = Srgba::from_color(lab_c);
+        .map(|&c| {
             [
-                (srgba.red * 255.0).round() as u8,
-                (srgba.green * 255.0).round() as u8,
-                (srgba.blue * 255.0).round() as u8,
+                (c.red * 255.0).round() as u8,
+                (c.green * 255.0).round() as u8,
+                (c.blue * 255.0).round() as u8,
                 255,
             ]
         })
