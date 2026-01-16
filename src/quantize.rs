@@ -3,6 +3,7 @@ use crate::error::Result;
 use image::RgbaImage;
 use palette::Srgb;
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 /// Maximum palette size
@@ -86,42 +87,48 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
             .collect();
 
         // Parallel processing for nearest neighbor mapping
-        indexed
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row_indices)| {
-                for x in 0..width {
-                    let base = y * in_stride + x * 4;
-                    let a = in_samples[base + 3];
-                    if a > 0 {
-                        let r = in_samples[base] as i32;
-                        let g = in_samples[base + 1] as i32;
-                        let b = in_samples[base + 2] as i32;
+        #[cfg(not(target_arch = "wasm32"))]
+        let chunks = indexed.par_chunks_mut(width);
+        #[cfg(target_arch = "wasm32")]
+        let chunks = indexed.chunks_mut(width);
 
-                        // Find nearest
-                        let mut min_dist = i32::MAX;
-                        let mut best_idx = 0;
+        chunks.enumerate().for_each(|(y, row_indices)| {
+            for x in 0..width {
+                let base = y * in_stride + x * 4;
+                let a = in_samples[base + 3];
+                if a > 0 {
+                    let r = in_samples[base] as i32;
+                    let g = in_samples[base + 1] as i32;
+                    let b = in_samples[base + 2] as i32;
 
-                        for (i, p_color) in palette_int.iter().enumerate() {
-                            // Integer squared Euclidean distance
-                            let dr = r - p_color[0];
-                            let dg = g - p_color[1];
-                            let db = b - p_color[2];
-                            let dist = dr * dr + dg * dg + db * db;
-                            if dist < min_dist {
-                                min_dist = dist;
-                                best_idx = i;
-                            }
+                    // Find nearest
+                    let mut min_dist = i32::MAX;
+                    let mut best_idx = 0;
+
+                    for (i, p_color) in palette_int.iter().enumerate() {
+                        // Integer squared Euclidean distance
+                        let dr = r - p_color[0];
+                        let dg = g - p_color[1];
+                        let db = b - p_color[2];
+                        let dist = dr * dr + dg * dg + db * db;
+                        if dist < min_dist {
+                            min_dist = dist;
+                            best_idx = i;
                         }
-
-                        row_indices[x] = best_idx as u8;
                     }
+
+                    row_indices[x] = best_idx as u8;
                 }
-            });
+            }
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let out_samples_iter = indexed.par_iter();
+        #[cfg(target_arch = "wasm32")]
+        let out_samples_iter = indexed.iter();
 
         // Write output pixels based on indexed
-        let out_samples: Vec<u8> = indexed
-            .par_iter()
+        let out_samples: Vec<u8> = out_samples_iter
             .map(|&idx| {
                 if idx == 255 {
                     // Transparent
@@ -329,6 +336,7 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
 
     // Use a fixed chunk size to ensure enough work per thread
     let chunk_size = 4096;
+    #[cfg(not(target_arch = "wasm32"))]
     indexed
         .par_chunks_mut(chunk_size)
         .enumerate()
@@ -496,9 +504,181 @@ pub fn quantize_image(img: &RgbaImage, config: &Config) -> Result<QuantizedImage
             }
         });
 
+    #[cfg(target_arch = "wasm32")]
+    indexed
+        .chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, indices)| {
+            let start_pixel = chunk_idx * chunk_size;
+            let palette_len = palette_vec.len();
+
+            // Process 4 pixels at a time for ILP
+            let limit_4 = indices.len() - (indices.len() % 4);
+            let mut i = 0;
+
+            while i < limit_4 {
+                let pixel_idx_base = start_pixel + i;
+                if pixel_idx_base + 3 >= in_samples.len() / 4 {
+                    break;
+                }
+
+                // Load 4 pixels (deinterleave RGBA -> R4, G4, B4, A4)
+                // SAFETY: bounds checked above
+                let (r4, g4, b4, a4) = unsafe {
+                    let b0 = (pixel_idx_base) * 4;
+                    let b1 = (pixel_idx_base + 1) * 4;
+                    let b2 = (pixel_idx_base + 2) * 4;
+                    let b3 = (pixel_idx_base + 3) * 4;
+                    (
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0) as i32,
+                            *in_samples.get_unchecked(b1) as i32,
+                            *in_samples.get_unchecked(b2) as i32,
+                            *in_samples.get_unchecked(b3) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 1) as i32,
+                            *in_samples.get_unchecked(b1 + 1) as i32,
+                            *in_samples.get_unchecked(b2 + 1) as i32,
+                            *in_samples.get_unchecked(b3 + 1) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 2) as i32,
+                            *in_samples.get_unchecked(b1 + 2) as i32,
+                            *in_samples.get_unchecked(b2 + 2) as i32,
+                            *in_samples.get_unchecked(b3 + 2) as i32,
+                        ]),
+                        i32x4::new([
+                            *in_samples.get_unchecked(b0 + 3) as i32,
+                            *in_samples.get_unchecked(b1 + 3) as i32,
+                            *in_samples.get_unchecked(b2 + 3) as i32,
+                            *in_samples.get_unchecked(b3 + 3) as i32,
+                        ]),
+                    )
+                };
+
+                // Initialize min_dist and best_idx for all 4 pixels
+                let mut min_dists = i32x4::splat(i32::MAX);
+                let mut best_idxs = i32x4::splat(0);
+
+                // Iterate through palette colors (scalar index, broadcast to 4 pixels)
+                for p_idx in 0..palette_len {
+                    // Broadcast palette color to all 4 lanes
+                    let pr = i32x4::splat(palette_r[p_idx]);
+                    let pg = i32x4::splat(palette_g[p_idx]);
+                    let pb = i32x4::splat(palette_b[p_idx]);
+
+                    let dr = r4 - pr;
+                    let dg = g4 - pg;
+                    let db = b4 - pb;
+
+                    let dist = (dr * dr) + (dg * dg) + (db * db);
+
+                    // Compare: is this distance smaller?
+                    let mask = dist.cmp_lt(min_dists);
+
+                    // Blend: update where mask is true
+                    min_dists = mask.blend(dist, min_dists);
+                    best_idxs = mask.blend(i32x4::splat(p_idx as i32), best_idxs);
+                }
+
+                // Branchless transparency: if alpha == 0, force index to 255
+                let transparent_mask = a4.cmp_eq(i32x4::splat(0));
+                let final_idxs: [i32; 4] =
+                    transparent_mask.blend(i32x4::splat(255), best_idxs).into();
+
+                // Write results
+                for j in 0..4 {
+                    let idx = final_idxs[j] as u8;
+                    indices[i + j] = idx;
+                }
+
+                i += 4;
+            }
+
+            // Scalar fallback for remaining pixels (with RLE cache)
+            let mut prev_pixel_val: u32 = u32::MAX;
+            let mut prev_best_idx: u8 = 0;
+
+            while i < indices.len() {
+                let pixel_idx = start_pixel + i;
+                if pixel_idx >= in_samples.len() / 4 {
+                    break;
+                }
+
+                let base = pixel_idx * 4;
+
+                let pixel_val = unsafe {
+                    let ptr = in_samples.as_ptr().add(base);
+                    *(ptr as *const u32)
+                };
+
+                let a = in_samples[base + 3];
+                if a == 0 {
+                    prev_pixel_val = pixel_val;
+                    prev_best_idx = 255;
+                    indices[i] = 255;
+                    i += 1;
+                    continue;
+                }
+
+                if pixel_val == prev_pixel_val {
+                    indices[i] = prev_best_idx;
+                    i += 1;
+                    continue;
+                }
+
+                let r = in_samples[base] as i32;
+                let g = in_samples[base + 1] as i32;
+                let b = in_samples[base + 2] as i32;
+
+                let r_cur = i32x8::splat(r);
+                let g_cur = i32x8::splat(g);
+                let b_cur = i32x8::splat(b);
+
+                let mut min_dist = i32::MAX;
+                let mut best_idx = 0;
+
+                let mut chunk_idx_inner = 0;
+                for k in 0..palette_chunks_r.len() {
+                    let p_r = palette_chunks_r[k];
+                    let p_g = palette_chunks_g[k];
+                    let p_b = palette_chunks_b[k];
+
+                    let dr = r_cur - p_r;
+                    let dg = g_cur - p_g;
+                    let db = b_cur - p_b;
+
+                    let dist_vec = (dr * dr) + (dg * dg) + (db * db);
+                    let dist_arr: [i32; 8] = dist_vec.into();
+
+                    for (l, &d) in dist_arr.iter().enumerate() {
+                        if d < min_dist {
+                            min_dist = d;
+                            best_idx = chunk_idx_inner + l;
+                        }
+                    }
+                    chunk_idx_inner += 8;
+                }
+
+                if best_idx >= palette_len {
+                    best_idx = 0;
+                }
+
+                prev_pixel_val = pixel_val;
+                prev_best_idx = best_idx as u8;
+                indices[i] = prev_best_idx;
+                i += 1;
+            }
+        });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let out_samples_iter = indexed.par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let out_samples_iter = indexed.iter();
+
     // Write output pixels based on indexed
-    let out_samples: Vec<u8> = indexed
-        .par_iter()
+    let out_samples: Vec<u8> = out_samples_iter
         .map(|&idx| {
             if idx == 255 {
                 vec![0, 0, 0, 0]

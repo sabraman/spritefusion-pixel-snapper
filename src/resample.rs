@@ -1,6 +1,7 @@
 use crate::error::{PixelSnapperError, Result};
 use crate::quantize::MAX_PALETTE;
 use image::{ImageBuffer, RgbaImage};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 /// Resample using pre-built palette and indexed buffer from quantization.
@@ -31,73 +32,75 @@ pub fn resample(
         let w = out_w;
         let samples = final_img.as_flat_samples_mut().samples;
 
-        samples
-            .par_chunks_exact_mut(4)
-            .enumerate()
-            .for_each(|(idx, pixel_sample)| {
-                let x_i = (idx as u32 % w) as usize;
-                let y_i = (idx as u32 / w) as usize;
+        #[cfg(not(target_arch = "wasm32"))]
+        let iter = samples.par_chunks_exact_mut(4).enumerate();
+        #[cfg(target_arch = "wasm32")]
+        let iter = samples.chunks_exact_mut(4).enumerate();
 
-                let ys = rows[y_i];
-                let ye = rows[y_i + 1];
-                let xs = cols[x_i];
-                let xe = cols[x_i + 1];
+        iter.for_each(|(idx, pixel_sample)| {
+            let x_i = (idx as u32 % w) as usize;
+            let y_i = (idx as u32 / w) as usize;
 
-                let best_pixel = if xe <= xs || ye <= ys {
-                    [0, 0, 0, 0]
-                } else if xe - xs == 1 && ye - ys == 1 {
-                    // 1:1 fast path
-                    if xs < in_width && ys < in_height {
-                        let idx = indexed[ys * in_width + xs];
-                        if (idx as usize) < palette_size {
-                            palette[idx as usize]
-                        } else {
-                            [0, 0, 0, 0]
-                        }
+            let ys = rows[y_i];
+            let ye = rows[y_i + 1];
+            let xs = cols[x_i];
+            let xe = cols[x_i + 1];
+
+            let best_pixel = if xe <= xs || ye <= ys {
+                [0, 0, 0, 0]
+            } else if xe - xs == 1 && ye - ys == 1 {
+                // 1:1 fast path
+                if xs < in_width && ys < in_height {
+                    let idx = indexed[ys * in_width + xs];
+                    if (idx as usize) < palette_size {
+                        palette[idx as usize]
                     } else {
                         [0, 0, 0, 0]
                     }
                 } else {
-                    // Zero-allocation fixed array counting
-                    let mut counts = [0u32; MAX_PALETTE];
+                    [0, 0, 0, 0]
+                }
+            } else {
+                // Zero-allocation fixed array counting
+                let mut counts = [0u32; MAX_PALETTE];
 
-                    for y in ys..ye.min(in_height) {
-                        let row_offset = y * in_width;
-                        for x in xs..xe.min(in_width) {
-                            // SAFETY: grid.rs sanitizes cuts to be <= limit.
-                            // row_offset + x is always within indexed bounds.
-                            let color_idx = unsafe { *indexed.get_unchecked(row_offset + x) };
-                            if (color_idx as usize) < palette_size {
-                                // SAFETY: color_idx < palette_size (checked above)
-                                unsafe {
-                                    *counts.get_unchecked_mut(color_idx as usize) += 1;
-                                }
+                for y in ys..ye.min(in_height) {
+                    let row_offset = y * in_width;
+                    for x in xs..xe.min(in_width) {
+                        // SAFETY: grid.rs sanitizes cuts to be <= limit.
+                        // row_offset + x is always within indexed bounds.
+                        let color_idx = unsafe { *indexed.get_unchecked(row_offset + x) };
+                        if (color_idx as usize) < palette_size {
+                            // SAFETY: color_idx < palette_size (checked above)
+                            unsafe {
+                                *counts.get_unchecked_mut(color_idx as usize) += 1;
                             }
                         }
                     }
+                }
 
-                    // Find mode in O(K)
-                    let mut best_idx = 0;
-                    let mut max_count = 0u32;
-                    for (i, &count) in counts[..palette_size].iter().enumerate() {
-                        if count > max_count {
-                            max_count = count;
-                            best_idx = i;
-                        }
+                // Find mode in O(K)
+                let mut best_idx = 0;
+                let mut max_count = 0u32;
+                for (i, &count) in counts[..palette_size].iter().enumerate() {
+                    if count > max_count {
+                        max_count = count;
+                        best_idx = i;
                     }
+                }
 
-                    if max_count > 0 {
-                        palette[best_idx]
-                    } else {
-                        [0, 0, 0, 0]
-                    }
-                };
+                if max_count > 0 {
+                    palette[best_idx]
+                } else {
+                    [0, 0, 0, 0]
+                }
+            };
 
-                pixel_sample[0] = best_pixel[0];
-                pixel_sample[1] = best_pixel[1];
-                pixel_sample[2] = best_pixel[2];
-                pixel_sample[3] = best_pixel[3];
-            });
+            pixel_sample[0] = best_pixel[0];
+            pixel_sample[1] = best_pixel[1];
+            pixel_sample[2] = best_pixel[2];
+            pixel_sample[3] = best_pixel[3];
+        });
     }
 
     Ok(final_img)

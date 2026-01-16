@@ -13,13 +13,13 @@ rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 kmeans_colors = { version = "0.6", features = ["palette_color"] }
 palette = { version = "0.7", features = ["std"] }
-rayon = "1.8"
 phf = { version = "0.11", features = ["macros"] }
 wide = "0.7"
 png = "0.18.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = { version = "0.1" }
+rayon = "1.8"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -31,3 +31,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

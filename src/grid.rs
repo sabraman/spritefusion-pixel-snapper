@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::{PixelSnapperError, Result};
 use std::cmp::Ordering;
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 // use wide::{u8x16, CmpEq}; // Portable SIMD wrapper logic deferred to next iteration if needed
@@ -34,7 +35,7 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
     // Raw indices from the quantized image (0..64)
     let indexed = &q_img.indexed;
 
-    // Use Rayon to scan rows. M-series chips have excellent parallel throughput.
+    #[cfg(not(target_arch = "wasm32"))]
     let (col_proj, row_proj) = (1..height - 1)
         .into_par_iter()
         .fold(
@@ -46,17 +47,10 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
 
                 let mut row_diff_sum = 0u32;
 
-                // [OPTIMIZATION 2] "Wide" SIMD Processing / Fast Scalar Loop
-                // Since this is indexed lookups, auto-vectorization is often better than manual gather.
-                // The scalar loop below is so simple with the LUT that LLVM on MacOS will auto-vectorize it efficiently.
-
                 let mut x = 1;
                 while x < width - 1 {
-                    // Fast LUT lookups
-                    // Because 'indexed' is u8 and luma_lut is small, this stays in L1 cache.
                     let idx_c = indexed[row_curr + x] as usize;
 
-                    // Skip Transparent if 255
                     if idx_c == 255 {
                         x += 1;
                         continue;
@@ -66,11 +60,6 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
                     let idx_r = indexed[row_curr + x + 1] as usize;
                     let idx_u = indexed[row_prev + x] as usize;
                     let idx_d = indexed[row_next + x] as usize;
-
-                    // Unchecked is safe because quantize guarantees valid indices
-                    // and luma_lut covers the full palette.
-                    // We handle transparent (255) by defaulting to 0 or check bounds.
-                    // Quantize sets transparent to 255.
 
                     let val_l = if idx_l < luma_lut.len() {
                         unsafe { *luma_lut.get_unchecked(idx_l) }
@@ -93,7 +82,6 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
                         0
                     };
 
-                    // Branchless abs_diff
                     cp[x] = cp[x].saturating_add(val_r.abs_diff(val_l) as u32);
                     row_diff_sum = row_diff_sum.saturating_add(val_d.abs_diff(val_u) as u32);
 
@@ -106,8 +94,7 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
         )
         .reduce(
             || (vec![0u32; width], vec![0u32; height]),
-            |(mut cp1, mut rp1), (cp2, rp2)| {
-                // Vectorized fold reduction
+            |(mut cp1, mut rp1): (Vec<u32>, Vec<u32>), (cp2, rp2): (Vec<u32>, Vec<u32>)| {
                 for (a, b) in cp1.iter_mut().zip(cp2.iter()) {
                     *a = a.saturating_add(*b);
                 }
@@ -117,6 +104,62 @@ pub fn compute_profiles(q_img: &QuantizedImage) -> Result<(Vec<u32>, Vec<u32>)> 
                 (cp1, rp1)
             },
         );
+
+    #[cfg(target_arch = "wasm32")]
+    let (col_proj, row_proj) = (1..height - 1).into_iter().fold(
+        (vec![0u32; width], vec![0u32; height]),
+        |(mut cp, mut rp), y| {
+            let row_curr = y * width;
+            let row_prev = (y - 1) * width;
+            let row_next = (y + 1) * width;
+
+            let mut row_diff_sum = 0u32;
+
+            let mut x = 1;
+            while x < width - 1 {
+                let idx_c = indexed[row_curr + x] as usize;
+
+                if idx_c == 255 {
+                    x += 1;
+                    continue;
+                }
+
+                let idx_l = indexed[row_curr + x - 1] as usize;
+                let idx_r = indexed[row_curr + x + 1] as usize;
+                let idx_u = indexed[row_prev + x] as usize;
+                let idx_d = indexed[row_next + x] as usize;
+
+                let val_l = if idx_l < luma_lut.len() {
+                    unsafe { *luma_lut.get_unchecked(idx_l) }
+                } else {
+                    0
+                };
+                let val_r = if idx_r < luma_lut.len() {
+                    unsafe { *luma_lut.get_unchecked(idx_r) }
+                } else {
+                    0
+                };
+                let val_u = if idx_u < luma_lut.len() {
+                    unsafe { *luma_lut.get_unchecked(idx_u) }
+                } else {
+                    0
+                };
+                let val_d = if idx_d < luma_lut.len() {
+                    unsafe { *luma_lut.get_unchecked(idx_d) }
+                } else {
+                    0
+                };
+
+                cp[x] = cp[x].saturating_add(val_r.abs_diff(val_l) as u32);
+                row_diff_sum = row_diff_sum.saturating_add(val_d.abs_diff(val_u) as u32);
+
+                x += 1;
+            }
+
+            rp[y] = row_diff_sum;
+            (cp, rp)
+        },
+    );
 
     Ok((col_proj, row_proj))
 }

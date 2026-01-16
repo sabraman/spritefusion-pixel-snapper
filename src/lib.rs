@@ -67,13 +67,13 @@ pub fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) ->
 
     let mut writer = encoder
         .write_header()
-        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
+        .map_err(|e| PixelSnapperError::ProcessingError(format!("PNG header error: {}", e)))?;
     writer
         .write_image_data(output_img.as_raw())
-        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
+        .map_err(|e| PixelSnapperError::ProcessingError(format!("PNG data error: {}", e)))?;
     writer
         .finish()
-        .map_err(|e| PixelSnapperError::ImageError(image::ImageError::IoError(e.into())))?;
+        .map_err(|e| PixelSnapperError::ProcessingError(format!("PNG finish error: {}", e)))?;
 
     Ok(output_bytes)
 }
